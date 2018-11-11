@@ -1,0 +1,7 @@
+config BR2_PACKAGE_WHITENOISE_BT_CONTROLLER
+        bool "whitenoise-bt-controller"
+	select BR2_PACKAGE_QT5
+	select BR2_PACKAGE_QT5CONNECTIVITY
+	select BR2_PACKAGE_BLUEZ5_UTILS
+        help
+          Control whitenoise audio as a BLE GATT service.
