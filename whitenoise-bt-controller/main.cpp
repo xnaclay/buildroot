@@ -57,12 +57,13 @@ std::vector<std::string> parse_cmd(const std::string &cmd) {
 void play(app_context &ctx) {
   std::cerr << "playing sound" << std::endl;
 
+  // TODO two players out of phase, fading in/out for seamless infinite noise
+
   ctx.playlist.clear();
   ctx.playlist.addMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
   ctx.playlist.setPlaybackMode(QMediaPlaylist::Loop);
 
   ctx.player.setPlaylist(&ctx.playlist);
-  ctx.player.setVolume(50);
   ctx.player.play();
 }
 
@@ -72,11 +73,13 @@ void stop(app_context &ctx) {
 }
 
 void vol_up(app_context &ctx) {
-  ctx.player.setVolume(ctx.player.volume() + 5);
+  std::cerr << "increasing volume by 3%" << std::endl;
+  ctx.player.setVolume(ctx.player.volume() + 3);
 }
 
 void vol_down(app_context &ctx) {
-  ctx.player.setVolume(ctx.player.volume() - 5);
+  std::cerr << "reducing volume by 3%" << std::endl;
+  ctx.player.setVolume(ctx.player.volume() - 3);
 }
 
 void bt_discover(app_context &ctx) {
@@ -112,6 +115,7 @@ void bt_connect(app_context &ctx, const QBluetoothAddress &address) {
 
       if (QString::compare(device->address(), address.toString()) == 0) {
         std::cerr << "found device; will connect: " << device->address().toStdString() << std::endl;
+        // FIXME this doesn't work
         device->connectToDevice();
       }
     }
@@ -153,7 +157,7 @@ void read_socket(app_context &ctx,
       vol_up(ctx);
     });
 
-    cmd_dispatch.emplace("VOL_UP", [&ctx]() {
+    cmd_dispatch.emplace("VOL_DOWN", [&ctx]() {
       vol_down(ctx);
     });
 
