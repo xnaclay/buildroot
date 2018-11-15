@@ -8,10 +8,16 @@
 #include <QtBluetooth>
 #include <QtMultimedia>
 
+#include <BluezQt/Manager>
+#include <BluezQt/Device>
+
 static const QLatin1String BT_SERVER_UUID("3bb45162-cecf-4bcb-be9f-026ec7ab38be");
 
 struct app_context {
   std::vector<QBluetoothSocket *> client_sockets;
+
+  QBluetoothLocalDevice local_device;
+  QBluetoothDeviceDiscoveryAgent disco_agent;
 
   QMediaPlaylist playlist;
   QMediaPlayer player;
@@ -66,15 +72,50 @@ void stop(app_context &ctx) {
 }
 
 void vol_up(app_context &ctx) {
+  ctx.player.setVolume(ctx.player.volume() + 5);
 }
 
 void vol_down(app_context &ctx) {
+  ctx.player.setVolume(ctx.player.volume() - 5);
 }
 
 void bt_discover(app_context &ctx) {
+  ctx.disco_agent.start();
 }
 
-void bt_connect(app_context &ctx) {
+void bt_device_discovered(app_context &ctx, const QBluetoothDeviceInfo &device) {
+  std::cerr << "discovered device: "
+            << device.address().toString().toStdString()
+            << " - "
+            << device.name().toStdString()
+            << std::endl;
+
+  for (const auto &socket : ctx.client_sockets) {
+    socket->write("BT_DEVICE,");
+    socket->write(device.name().replace(",", "_").toUtf8());
+    socket->write(",");
+    socket->write(device.address().toString().replace(",", "_").toUtf8());
+    socket->write("\n");
+  }
+}
+
+void bt_connect(app_context &ctx, const QBluetoothAddress &address) {
+  std::cerr << "connecting to device: " << address.toString().toStdString() << std::endl;
+  if (ctx.local_device.pairingStatus(address) == QBluetoothLocalDevice::Unpaired) {
+    std::cerr << "device is unpaired; will pair: " << address.toString().toStdString() << std::endl;
+    ctx.local_device.requestPairing(address, QBluetoothLocalDevice::AuthorizedPaired);
+    // TODO handle pairing finished
+  } else {
+    BluezQt::Manager manager;
+    for (const auto &device : manager.devices()) {
+      std::cerr << "known device: " << device->address().toStdString() << std::endl;
+
+      if (QString::compare(device->address(), address.toString()) == 0) {
+        std::cerr << "found device; will connect: " << device->address().toStdString() << std::endl;
+        device->connectToDevice();
+      }
+    }
+  }
 }
 
 void read_socket(app_context &ctx,
@@ -90,7 +131,13 @@ void read_socket(app_context &ctx,
 
     auto cmdv = parse_cmd(recv_cmd);
 
-    std::cerr << "cmdv[0]: " << cmdv[0].c_str() << std::endl;
+    for (unsigned long i = 0; i < cmdv.size(); i++) {
+      std::cerr << "cmdv["
+                << i
+                << "]: "
+                << cmdv[i]
+                << std::endl;
+    }
 
     std::map<std::string, std::function<void()>> cmd_dispatch;
 
@@ -102,12 +149,20 @@ void read_socket(app_context &ctx,
       stop(ctx);
     });
 
-    cmd_dispatch.emplace("SCAN", []() {
-      std::cerr << "handling SCAN command" << std::endl;
+    cmd_dispatch.emplace("VOL_UP", [&ctx]() {
+      vol_up(ctx);
     });
 
-    cmd_dispatch.emplace("CONNECT", []() {
-      std::cerr << "handling CONNECT command" << std::endl;
+    cmd_dispatch.emplace("VOL_UP", [&ctx]() {
+      vol_down(ctx);
+    });
+
+    cmd_dispatch.emplace("SCAN", [&ctx]() {
+      bt_discover(ctx);
+    });
+
+    cmd_dispatch.emplace("CONNECT", [&ctx, &cmdv]() {
+      bt_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
     });
 
     auto cmd_it = cmd_dispatch.find(cmdv[0]);
@@ -129,12 +184,16 @@ void client_connected(QBluetoothServer &rfcomm_server,
     return;
   }
 
-  QObject::connect(socket, &QBluetoothSocket::readyRead, [&ctx, socket]() {
-    read_socket(ctx, socket);
-  });
-  QObject::connect(socket, &QBluetoothSocket::disconnected, [&ctx, socket]() {
-    client_disconnected(ctx, socket);
-  });
+  QObject::connect(socket,
+                   &QBluetoothSocket::readyRead,
+                   [&ctx, socket]() {
+                     read_socket(ctx, socket);
+                   });
+  QObject::connect(socket,
+                   &QBluetoothSocket::disconnected,
+                   [&ctx, socket]() {
+                     client_disconnected(ctx, socket);
+                   });
   ctx.client_sockets.push_back(socket);
 
   std::cerr << "client connected: " << socket->peerName().toStdString() << std::endl;
@@ -147,31 +206,37 @@ int main(int argc, char *argv[]) {
 
   app_context ctx;
 
+  QObject::connect(&ctx.disco_agent,
+                   &QBluetoothDeviceDiscoveryAgent::deviceDiscovered,
+                   [&ctx](const QBluetoothDeviceInfo &device) {
+                     bt_device_discovered(ctx, device);
+                   });
+
   QBluetoothServer rfcomm_server(QBluetoothServiceInfo::RfcommProtocol, &a);
   QBluetoothServiceInfo service_info;
 
-  QBluetoothLocalDevice local_device;
-
-  if (!local_device.isValid()) {
+  if (!ctx.local_device.isValid()) {
     std::cerr << "no valid BT device" << std::endl;
     return 1;
   }
 
   std::cerr << "powering on device" << std::endl;
-  local_device.powerOn();
+  ctx.local_device.powerOn();
   std::cerr << "becoming discoverable" << std::endl;
-  local_device.setHostMode(QBluetoothLocalDevice::HostDiscoverable);
+  ctx.local_device.setHostMode(QBluetoothLocalDevice::HostDiscoverable);
 
-  if (!rfcomm_server.listen(local_device.address())) {
+  if (!rfcomm_server.listen(ctx.local_device.address())) {
     std::cerr << "cannot bind server to: "
-              << local_device.address().toString().toStdString()
+              << ctx.local_device.address().toString().toStdString()
               << std::endl;
     return 1;
   }
 
-  QObject::connect(&rfcomm_server, &QBluetoothServer::newConnection, [&rfcomm_server, &ctx]() {
-    client_connected(rfcomm_server, ctx);
-  });
+  QObject::connect(&rfcomm_server,
+                   &QBluetoothServer::newConnection,
+                   [&rfcomm_server, &ctx]() {
+                     client_connected(rfcomm_server, ctx);
+                   });
 
   QBluetoothServiceInfo::Sequence class_id;
   class_id << QVariant::fromValue(QBluetoothUuid(QBluetoothUuid::SerialPort));
@@ -203,7 +268,7 @@ int main(int argc, char *argv[]) {
   protocol_descriptor_list.append(QVariant::fromValue(protocol));
   service_info.setAttribute(QBluetoothServiceInfo::ProtocolDescriptorList, protocol_descriptor_list);
 
-  service_info.registerService(local_device.address());
+  service_info.registerService(ctx.local_device.address());
 
   auto result = QCoreApplication::exec();
 
