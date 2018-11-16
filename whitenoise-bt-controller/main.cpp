@@ -8,6 +8,7 @@
 #include <QtBluetooth>
 #include <QtMultimedia>
 
+#include <BluezQt/InitManagerJob>
 #include <BluezQt/Manager>
 #include <BluezQt/Device>
 
@@ -16,11 +17,15 @@ static const QLatin1String BT_SERVER_UUID("3bb45162-cecf-4bcb-be9f-026ec7ab38be"
 struct app_context {
   std::vector<QBluetoothSocket *> client_sockets;
 
+  BluezQt::Manager manager;
+
   QBluetoothLocalDevice local_device;
   QBluetoothDeviceDiscoveryAgent disco_agent;
 
-  QMediaPlaylist playlist;
-  QMediaPlayer player;
+  QTimer player_timer;
+  bool player_switch = false;
+  QMediaPlayer player_a;
+  QMediaPlayer player_b;
 };
 
 void client_disconnected(app_context &ctx,
@@ -57,29 +62,61 @@ std::vector<std::string> parse_cmd(const std::string &cmd) {
 void play(app_context &ctx) {
   std::cerr << "playing sound" << std::endl;
 
-  // TODO two players out of phase, fading in/out for seamless infinite noise
+  ctx.player_a.setPosition(0);
+  ctx.player_a.play();
 
-  ctx.playlist.clear();
-  ctx.playlist.addMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
-  ctx.playlist.setPlaybackMode(QMediaPlaylist::Loop);
+  ctx.player_timer.setInterval(30000);
+  ctx.player_timer.start();
+}
 
-  ctx.player.setPlaylist(&ctx.playlist);
-  ctx.player.play();
+void play_interval(app_context &ctx) {
+  if (ctx.player_switch) {
+    ctx.player_a.setPosition(0);
+    ctx.player_a.play();
+  } else {
+    ctx.player_b.setPosition(0);
+    ctx.player_b.play();
+  }
+
+  ctx.player_switch = !ctx.player_switch;
 }
 
 void stop(app_context &ctx) {
   std::cerr << "stopping sound" << std::endl;
-  ctx.player.stop();
+  ctx.player_a.stop();
+  ctx.player_b.stop();
+  ctx.player_timer.stop();
+}
+
+void report_vol(app_context &ctx) {
+  int vol = ctx.player_a.volume();
+
+  for (const auto &socket : ctx.client_sockets) {
+    socket->write("VOL,");
+    socket->write(std::to_string(vol).c_str());
+    socket->write("\n");
+  }
 }
 
 void vol_up(app_context &ctx) {
   std::cerr << "increasing volume by 3%" << std::endl;
-  ctx.player.setVolume(ctx.player.volume() + 3);
+  ctx.player_a.setVolume(ctx.player_a.volume() + 3);
+  ctx.player_b.setVolume(ctx.player_a.volume());
+  report_vol(ctx);
 }
 
 void vol_down(app_context &ctx) {
   std::cerr << "reducing volume by 3%" << std::endl;
-  ctx.player.setVolume(ctx.player.volume() - 3);
+  ctx.player_a.setVolume(ctx.player_a.volume() - 3);
+  ctx.player_b.setVolume(ctx.player_a.volume());
+  report_vol(ctx);
+}
+
+void set_vol(app_context &ctx, int vol) {
+  std::cerr << "setting volume to: " << vol << "%" << std::endl;
+  ctx.player_a.setVolume(vol);
+  ctx.player_b.setVolume(ctx.player_a.volume());
+  report_vol(ctx);
 }
 
 void bt_discover(app_context &ctx) {
@@ -95,30 +132,53 @@ void bt_device_discovered(app_context &ctx, const QBluetoothDeviceInfo &device) 
 
   for (const auto &socket : ctx.client_sockets) {
     socket->write("BT_DEVICE,");
-    socket->write(device.name().replace(",", "_").toUtf8());
-    socket->write(",");
     socket->write(device.address().toString().replace(",", "_").toUtf8());
+    socket->write(",");
+    socket->write(device.name().replace(",", "_").toUtf8());
     socket->write("\n");
   }
 }
 
-void bt_connect(app_context &ctx, const QBluetoothAddress &address) {
+void bt_connect(const app_context &ctx, const QBluetoothAddress &address) {
+  for (const auto &device : ctx.manager.devices()) {
+    std::cerr << "known device: " << device->address().toStdString() << std::endl;
+
+    if (QString::compare(device->address(), address.toString()) == 0) {
+      std::cerr << "found device; will connect: " << device->address().toStdString() << std::endl;
+      device->connectToDevice();
+      return;
+    }
+  }
+
+  std::cerr << "could not find device to connect: "
+            << address.toString().toStdString()
+            << std::endl;
+}
+
+void bt_pairing_finished(app_context &ctx, const QBluetoothAddress &address,
+                         QBluetoothLocalDevice::Pairing pairing) {
+
+  if (pairing == QBluetoothLocalDevice::Unpaired) {
+    std::cerr << "failed to pair device: "
+              << address.toString().toStdString()
+              << std::endl;
+    return;
+  }
+
+  std::cerr << "device "
+            << address.toString().toStdString()
+            << " finished pairing; will attempt to connect"
+            << std::endl;
+  bt_connect(ctx, address);
+}
+
+void bt_pair_or_connect(app_context &ctx, const QBluetoothAddress &address) {
   std::cerr << "connecting to device: " << address.toString().toStdString() << std::endl;
   if (ctx.local_device.pairingStatus(address) == QBluetoothLocalDevice::Unpaired) {
     std::cerr << "device is unpaired; will pair: " << address.toString().toStdString() << std::endl;
     ctx.local_device.requestPairing(address, QBluetoothLocalDevice::AuthorizedPaired);
-    // TODO handle pairing finished
   } else {
-    BluezQt::Manager manager;
-    for (const auto &device : manager.devices()) {
-      std::cerr << "known device: " << device->address().toStdString() << std::endl;
-
-      if (QString::compare(device->address(), address.toString()) == 0) {
-        std::cerr << "found device; will connect: " << device->address().toStdString() << std::endl;
-        // FIXME this doesn't work
-        device->connectToDevice();
-      }
-    }
+    bt_connect(ctx, address);
   }
 }
 
@@ -161,12 +221,16 @@ void read_socket(app_context &ctx,
       vol_down(ctx);
     });
 
+    cmd_dispatch.emplace("SET_VOL", [&ctx, &cmdv]() {
+      set_vol(ctx, std::stoi(cmdv[1]));
+    });
+
     cmd_dispatch.emplace("SCAN", [&ctx]() {
       bt_discover(ctx);
     });
 
     cmd_dispatch.emplace("CONNECT", [&ctx, &cmdv]() {
-      bt_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
+      bt_pair_or_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
     });
 
     auto cmd_it = cmd_dispatch.find(cmdv[0]);
@@ -210,10 +274,26 @@ int main(int argc, char *argv[]) {
 
   app_context ctx;
 
+  ctx.player_a.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
+  ctx.player_b.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
+
   QObject::connect(&ctx.disco_agent,
                    &QBluetoothDeviceDiscoveryAgent::deviceDiscovered,
                    [&ctx](const QBluetoothDeviceInfo &device) {
                      bt_device_discovered(ctx, device);
+                   });
+
+  QObject::connect(&ctx.local_device,
+                   &QBluetoothLocalDevice::pairingFinished,
+                   [&ctx](const QBluetoothAddress &address,
+                          QBluetoothLocalDevice::Pairing pairing) {
+                     bt_pairing_finished(ctx, address, pairing);
+                   });
+
+  QObject::connect(&ctx.player_timer,
+                   &QTimer::timeout,
+                   [&ctx]() {
+                     play_interval(ctx);
                    });
 
   QBluetoothServer rfcomm_server(QBluetoothServiceInfo::RfcommProtocol, &a);
@@ -273,6 +353,30 @@ int main(int argc, char *argv[]) {
   service_info.setAttribute(QBluetoothServiceInfo::ProtocolDescriptorList, protocol_descriptor_list);
 
   service_info.registerService(ctx.local_device.address());
+
+  std::cerr << "initializing BluezQt manager" << std::endl;
+  auto mgr_init_job = ctx.manager.init();
+  mgr_init_job->start();
+
+  QObject::connect(mgr_init_job,
+                   &BluezQt::InitManagerJob::result,
+                   [](BluezQt::InitManagerJob *job) {
+                     std::cerr << "received result for BluezQt manager initialization" << std::endl;
+
+                     if (job->manager()->isInitialized()) {
+                       std::cerr << "BluezQt manager is initialized" << std::endl;
+                     } else {
+                       std::cerr << "BluezQt manager is not initialized" << std::endl;
+                     }
+
+                     if (job->manager()->isOperational()) {
+                       std::cerr << "BluezQt manager is operational" << std::endl;
+                     } else {
+                       std::cerr << "BluezQt manager is not operational" << std::endl;
+                     }
+
+                     job->deleteLater();
+                   });
 
   auto result = QCoreApplication::exec();
 
