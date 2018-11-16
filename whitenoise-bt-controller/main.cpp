@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <sstream>
 #include <iostream>
+#include <fstream>
 #include <string>
+
+#include <unistd.h>
 
 #include <QDebug>
 #include <QCoreApplication>
@@ -21,8 +24,10 @@ struct app_context {
 
   QBluetoothLocalDevice local_device;
   QBluetoothDeviceDiscoveryAgent disco_agent;
+  QTimer scan_timer;
 
   QTimer player_timer;
+  bool playing = false;
   bool player_switch = false;
   QMediaPlayer player_a;
   QMediaPlayer player_b;
@@ -59,14 +64,66 @@ std::vector<std::string> parse_cmd(const std::string &cmd) {
   return std::move(cmdv);
 }
 
+void save_state(app_context &ctx) {
+
+  std::ofstream play_state_of;
+  play_state_of.open(".whitenoise-bt-controller.state.play");
+  if (ctx.playing) {
+    play_state_of << "true";
+  } else {
+    play_state_of << "false";
+  }
+  play_state_of.close();
+
+  std::ofstream vol_state_of;
+  vol_state_of.open(".whitenoise-bt-controller.state.vol");
+  vol_state_of << ctx.player_a.volume();
+  vol_state_of.close();
+
+  sync();
+}
+
 void play(app_context &ctx) {
   std::cerr << "playing sound" << std::endl;
+
+  ctx.playing = true;
 
   ctx.player_a.setPosition(0);
   ctx.player_a.play();
 
   ctx.player_timer.setInterval(30000);
   ctx.player_timer.start();
+
+  save_state(ctx);
+}
+
+void restore_state(app_context &ctx) {
+  int vol;
+  std::ifstream vol_state_if;
+  vol_state_if.open(".whitenoise-bt-controller.state.vol");
+
+  if (!vol_state_if.fail()) {
+    vol_state_if >> vol;
+    std::cerr << "restoring volume: " << vol << std::endl;
+    ctx.player_a.setVolume(vol);
+    ctx.player_b.setVolume(vol);
+  }
+
+  vol_state_if.close();
+
+  std::string play_state_txt;
+  std::ifstream play_state_if;
+  if (!play_state_if.fail()) {
+    play_state_if.open(".whitenoise-bt-controller.state.play");
+    play_state_if >> play_state_txt;
+
+    if (play_state_txt == "true") {
+      std::cerr << "restoring playing state" << std::endl;
+      play(ctx);
+    }
+  }
+
+  play_state_if.close();
 }
 
 void play_interval(app_context &ctx) {
@@ -83,9 +140,14 @@ void play_interval(app_context &ctx) {
 
 void stop(app_context &ctx) {
   std::cerr << "stopping sound" << std::endl;
-  ctx.player_a.stop();
-  ctx.player_b.stop();
+  ctx.player_a.pause();
+  ctx.player_a.setPosition(0);
+  ctx.player_b.pause();
+  ctx.player_b.setPosition(0);
   ctx.player_timer.stop();
+  ctx.player_switch = false;
+  ctx.playing = false;
+  save_state(ctx);
 }
 
 void report_vol(app_context &ctx) {
@@ -103,6 +165,7 @@ void vol_up(app_context &ctx) {
   ctx.player_a.setVolume(ctx.player_a.volume() + 3);
   ctx.player_b.setVolume(ctx.player_a.volume());
   report_vol(ctx);
+  save_state(ctx);
 }
 
 void vol_down(app_context &ctx) {
@@ -110,6 +173,7 @@ void vol_down(app_context &ctx) {
   ctx.player_a.setVolume(ctx.player_a.volume() - 3);
   ctx.player_b.setVolume(ctx.player_a.volume());
   report_vol(ctx);
+  save_state(ctx);
 }
 
 void set_vol(app_context &ctx, int vol) {
@@ -117,26 +181,11 @@ void set_vol(app_context &ctx, int vol) {
   ctx.player_a.setVolume(vol);
   ctx.player_b.setVolume(ctx.player_a.volume());
   report_vol(ctx);
+  save_state(ctx);
 }
 
 void bt_discover(app_context &ctx) {
   ctx.disco_agent.start();
-}
-
-void bt_device_discovered(app_context &ctx, const QBluetoothDeviceInfo &device) {
-  std::cerr << "discovered device: "
-            << device.address().toString().toStdString()
-            << " - "
-            << device.name().toStdString()
-            << std::endl;
-
-  for (const auto &socket : ctx.client_sockets) {
-    socket->write("BT_DEVICE,");
-    socket->write(device.address().toString().replace(",", "_").toUtf8());
-    socket->write(",");
-    socket->write(device.name().replace(",", "_").toUtf8());
-    socket->write("\n");
-  }
 }
 
 void bt_connect(const app_context &ctx, const QBluetoothAddress &address) {
@@ -153,6 +202,37 @@ void bt_connect(const app_context &ctx, const QBluetoothAddress &address) {
   std::cerr << "could not find device to connect: "
             << address.toString().toStdString()
             << std::endl;
+}
+
+void bt_device_discovered(app_context &ctx, const QBluetoothDeviceInfo &device) {
+  std::cerr << "discovered device: "
+            << device.address().toString().toStdString()
+            << " - "
+            << device.name().toStdString()
+            << std::endl;
+
+  for (const auto &socket : ctx.client_sockets) {
+    socket->write("BT_DEVICE,");
+    socket->write(device.address().toString().replace(",", "_").toUtf8());
+    socket->write(",");
+    socket->write(device.name().replace(",", "_").toUtf8());
+    socket->write("\n");
+  }
+
+  // attempt to auto connect if paired
+  if (ctx.local_device.pairingStatus(device.address()) != QBluetoothLocalDevice::Unpaired) {
+    bool is_connected = false;
+
+    for (const QBluetoothAddress &connected_addr : ctx.local_device.connectedDevices()) {
+      if (QString::compare(connected_addr.toString(), device.address().toString()) == 0) {
+        is_connected = true;
+      }
+    }
+
+    if (!is_connected) {
+      bt_connect(ctx, device.address());
+    }
+  }
 }
 
 void bt_pairing_finished(app_context &ctx, const QBluetoothAddress &address,
@@ -272,7 +352,7 @@ int main(int argc, char *argv[]) {
   QLoggingCategory::setFilterRules(QStringLiteral("qt.bluetooth* = true\nqt.multimedia = true\n*.debug = true"));
   QCoreApplication a(argc, argv);
 
-  app_context ctx;
+  app_context ctx = {};
 
   ctx.player_a.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
   ctx.player_b.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
@@ -377,6 +457,17 @@ int main(int argc, char *argv[]) {
 
                      job->deleteLater();
                    });
+
+  restore_state(ctx);
+
+  QObject::connect(&ctx.scan_timer,
+                   &QTimer::timeout,
+                   [&ctx]() {
+                     bt_discover(ctx);
+                   });
+  ctx.scan_timer.setSingleShot(true);
+  ctx.scan_timer.setInterval(10000);
+  ctx.scan_timer.start();
 
   auto result = QCoreApplication::exec();
 
