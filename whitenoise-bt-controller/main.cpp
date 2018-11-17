@@ -25,6 +25,7 @@ struct app_context {
   QBluetoothLocalDevice local_device;
   QBluetoothDeviceDiscoveryAgent disco_agent;
   QTimer scan_timer;
+  QTimer advertise_timer;
 
   QTimer player_timer;
   bool playing = false;
@@ -468,6 +469,14 @@ int main(int argc, char *argv[]) {
   ctx.scan_timer.setSingleShot(true);
   ctx.scan_timer.setInterval(10000);
   ctx.scan_timer.start();
+
+  QObject::connect(&ctx.advertise_timer,
+                   &QTimer::timeout,
+                   [&ctx]() {
+                     ctx.local_device.setHostMode(QBluetoothLocalDevice::HostDiscoverable);
+                   });
+  ctx.advertise_timer.setInterval(30000);
+  ctx.advertise_timer.start();
 
   auto result = QCoreApplication::exec();
 
