@@ -288,13 +288,14 @@ void bt_pairing_finished(app_context &ctx,
 }
 
 void bt_connected(app_context &ctx, const QBluetoothAddress &address) {
-
-  if (QString::compare(address.toString(), ctx.speaker_device.toString()) == 0) {
-    std::cerr << "speaker device connected: "
-              << address.toString().toStdString()
-              << std::endl;
-    ctx.connected_speaker = true;
-    report_status(ctx);
+  for (const QBluetoothAddress &connected_addr : ctx.local_device.connectedDevices()) {
+    if (QString::compare(connected_addr.toString(), ctx.speaker_device.toString()) == 0) {
+      std::cerr << "speaker device connected: "
+                << address.toString().toStdString()
+                << std::endl;
+      ctx.connected_speaker = true;
+      report_status(ctx);
+    }
   }
 }
 
@@ -305,7 +306,7 @@ void bt_disconnected(app_context &ctx, const QBluetoothAddress &address) {
               << address.toString().toStdString()
               << std::endl;
     ctx.connected_speaker = false;
-    report_status(ctx);
+    stop(ctx);
   }
 }
 
@@ -323,6 +324,8 @@ void bt_pair_or_connect(app_context &ctx, const QBluetoothAddress &address) {
 void bt_unpair_speaker(app_context &ctx) {
   std::cerr << "removing speaker device" << std::endl;
   ctx.local_device.requestPairing(ctx.speaker_device, QBluetoothLocalDevice::Unpaired);
+  ctx.speaker_device.clear();
+  ctx.settings.remove("speaker.address");
 }
 
 void read_socket(app_context &ctx,
