@@ -23,6 +23,7 @@ struct app_context {
 
   BluezQt::Manager manager;
 
+  QSettings settings;
   QBluetoothLocalDevice local_device;
   QBluetoothDeviceDiscoveryAgent disco_agent;
 
@@ -158,6 +159,14 @@ void restore_state(app_context &ctx) {
   }
 
   play_state_if.close();
+
+  if (ctx.settings.contains("speaker.address")) {
+    QBluetoothAddress speaker_addr(ctx.settings.value("speaker.address").toString());
+    std::cerr << "restoring speaker device: "
+              << speaker_addr.toString().toStdString()
+              << std::endl;
+    ctx.speaker_device = speaker_addr;
+  }
 }
 
 void play_interval(app_context &ctx) {
@@ -254,9 +263,8 @@ void bt_device_discovered(app_context &ctx, const QBluetoothDeviceInfo &device) 
       }
     }
 
-    if (!is_connected) {
+    if (!is_connected && QString::compare(device.address().toString(), ctx.speaker_device.toString()) == 0) {
       bt_connect(ctx, device.address());
-    } else {
     }
   }
 }
@@ -281,7 +289,7 @@ void bt_pairing_finished(app_context &ctx,
 
 void bt_connected(app_context &ctx, const QBluetoothAddress &address) {
 
-  if (QString::compare(address.toString(), ctx.speaker_device.toString())) {
+  if (QString::compare(address.toString(), ctx.speaker_device.toString()) == 0) {
     std::cerr << "speaker device connected: "
               << address.toString().toStdString()
               << std::endl;
@@ -292,7 +300,7 @@ void bt_connected(app_context &ctx, const QBluetoothAddress &address) {
 
 void bt_disconnected(app_context &ctx, const QBluetoothAddress &address) {
 
-  if (QString::compare(address.toString(), ctx.speaker_device.toString())) {
+  if (QString::compare(address.toString(), ctx.speaker_device.toString()) == 0) {
     std::cerr << "speaker device disconnected: "
               << address.toString().toStdString()
               << std::endl;
@@ -303,7 +311,6 @@ void bt_disconnected(app_context &ctx, const QBluetoothAddress &address) {
 
 void bt_pair_or_connect(app_context &ctx, const QBluetoothAddress &address) {
   std::cerr << "connecting to device: " << address.toString().toStdString() << std::endl;
-  ctx.speaker_device = address;
 
   if (ctx.local_device.pairingStatus(address) == QBluetoothLocalDevice::Unpaired) {
     std::cerr << "device is unpaired; will pair: " << address.toString().toStdString() << std::endl;
@@ -366,6 +373,8 @@ void read_socket(app_context &ctx,
     });
 
     cmd_dispatch.emplace("CONNECT", [&ctx, &cmdv]() {
+      ctx.speaker_device = QBluetoothAddress(QString::fromStdString(cmdv[1]));
+      ctx.settings.setValue("speaker.address", QString::fromStdString(cmdv[1]));
       bt_pair_or_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
     });
 
