@@ -378,7 +378,21 @@ void read_socket(app_context &ctx,
     cmd_dispatch.emplace("CONNECT", [&ctx, &cmdv]() {
       ctx.speaker_device = QBluetoothAddress(QString::fromStdString(cmdv[1]));
       ctx.settings.setValue("speaker.address", QString::fromStdString(cmdv[1]));
-      bt_pair_or_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
+      ctx.connected_speaker = false;
+
+      for (const QBluetoothAddress &connected_addr : ctx.local_device.connectedDevices()) {
+        if (QString::compare(connected_addr.toString(), ctx.speaker_device.toString()) == 0) {
+          std::cerr << "speaker device connected: "
+                    << connected_addr.toString().toStdString()
+                    << std::endl;
+          ctx.connected_speaker = true;
+          report_status(ctx);
+        }
+      }
+
+      if (!ctx.connected_speaker) {
+        bt_pair_or_connect(ctx, QBluetoothAddress(QString::fromStdString(cmdv[1])));
+      }
     });
 
     cmd_dispatch.emplace("UNPAIR_SPEAKER", [&ctx]() {
