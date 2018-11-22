@@ -16,6 +16,8 @@
 #include <BluezQt/Device>
 #include <QtBluetooth/QBluetoothLocalDevice>
 
+#include "noise_device.h"
+
 static const QLatin1String BT_SERVER_UUID("3bb45162-cecf-4bcb-be9f-026ec7ab38be");
 
 struct app_context {
@@ -33,11 +35,9 @@ struct app_context {
   QTimer scan_timer;
   QTimer advertise_timer;
 
-  QTimer player_timer;
   bool playing = false;
-  bool player_switch = false;
-  QMediaPlayer player_a;
-  QMediaPlayer player_b;
+  noise_device noise;
+  QAudioOutput *player = nullptr;
 };
 
 void client_disconnected(app_context &ctx,
@@ -72,30 +72,17 @@ std::vector<std::string> parse_cmd(const std::string &cmd) {
 }
 
 void save_state(app_context &ctx) {
-
-  std::ofstream play_state_of;
-  play_state_of.open(".whitenoise-bt-controller.state.play");
-  if (ctx.playing) {
-    play_state_of << "true";
-  } else {
-    play_state_of << "false";
-  }
-  play_state_of.close();
-
-  std::ofstream vol_state_of;
-  vol_state_of.open(".whitenoise-bt-controller.state.vol");
-  vol_state_of << ctx.player_a.volume();
-  vol_state_of.close();
-
+  ctx.settings.setValue("player.playing", ctx.playing);
+  ctx.settings.setValue("player.volume", ctx.noise.volume());
   sync();
 }
 
 void report_status(app_context &ctx) {
-  int vol = ctx.player_a.volume();
+  qreal vol = ctx.noise.volume();
 
   for (const auto &socket : ctx.client_sockets) {
     socket->write("VOL,");
-    socket->write(std::to_string(vol).c_str());
+    socket->write(std::to_string(static_cast<int>(vol * 100)).c_str());
     socket->write("\n");
 
     if (ctx.connected_speaker) {
@@ -121,44 +108,25 @@ void play(app_context &ctx) {
   std::cerr << "playing sound" << std::endl;
 
   ctx.playing = true;
-
-  ctx.player_a.setPosition(0);
-  ctx.player_a.play();
-
-  ctx.player_timer.setInterval(30000);
-  ctx.player_timer.start();
+  ctx.noise.unquiet();
 
   report_status(ctx);
   save_state(ctx);
 }
 
 void restore_state(app_context &ctx) {
-  int vol;
-  std::ifstream vol_state_if;
-  vol_state_if.open(".whitenoise-bt-controller.state.vol");
-
-  if (!vol_state_if.fail()) {
-    vol_state_if >> vol;
-    std::cerr << "restoring volume: " << vol << std::endl;
-    ctx.player_a.setVolume(vol);
-    ctx.player_b.setVolume(vol);
-  }
-
-  vol_state_if.close();
-
-  std::string play_state_txt;
-  std::ifstream play_state_if;
-  if (!play_state_if.fail()) {
-    play_state_if.open(".whitenoise-bt-controller.state.play");
-    play_state_if >> play_state_txt;
-
-    if (play_state_txt == "true") {
+  if (ctx.settings.contains("player.playing")) {
+    bool playing = ctx.settings.value("player.playing").toBool();
+    if (playing) {
       std::cerr << "restoring playing state" << std::endl;
       play(ctx);
     }
   }
 
-  play_state_if.close();
+  if (ctx.settings.contains("player.volume")) {
+    qreal vol = ctx.settings.value("player.volume").toReal();
+    ctx.noise.setVolume(vol);
+  }
 
   if (ctx.settings.contains("speaker.address")) {
     QBluetoothAddress speaker_addr(ctx.settings.value("speaker.address").toString());
@@ -169,26 +137,9 @@ void restore_state(app_context &ctx) {
   }
 }
 
-void play_interval(app_context &ctx) {
-  if (ctx.player_switch) {
-    ctx.player_a.setPosition(0);
-    ctx.player_a.play();
-  } else {
-    ctx.player_b.setPosition(0);
-    ctx.player_b.play();
-  }
-
-  ctx.player_switch = !ctx.player_switch;
-}
-
 void stop(app_context &ctx) {
   std::cerr << "stopping sound" << std::endl;
-  ctx.player_a.pause();
-  ctx.player_a.setPosition(0);
-  ctx.player_b.pause();
-  ctx.player_b.setPosition(0);
-  ctx.player_timer.stop();
-  ctx.player_switch = false;
+  ctx.noise.quiet();
   ctx.playing = false;
   report_status(ctx);
   save_state(ctx);
@@ -196,24 +147,22 @@ void stop(app_context &ctx) {
 
 void vol_up(app_context &ctx) {
   std::cerr << "increasing volume by 3%" << std::endl;
-  ctx.player_a.setVolume(ctx.player_a.volume() + 3);
-  ctx.player_b.setVolume(ctx.player_a.volume());
+  ctx.noise.setVolume(ctx.noise.volume() * 1.03);
   report_status(ctx);
   save_state(ctx);
 }
 
 void vol_down(app_context &ctx) {
   std::cerr << "reducing volume by 3%" << std::endl;
-  ctx.player_a.setVolume(ctx.player_a.volume() - 3);
-  ctx.player_b.setVolume(ctx.player_a.volume());
+  ctx.noise.setVolume(ctx.noise.volume() * 0.97);
   report_status(ctx);
   save_state(ctx);
 }
 
 void set_vol(app_context &ctx, int vol) {
   std::cerr << "setting volume to: " << vol << "%" << std::endl;
-  ctx.player_a.setVolume(vol);
-  ctx.player_b.setVolume(ctx.player_a.volume());
+//  ctx.noise.setVolume(log(static_cast<double>(vol) / 100.0) / log(10));
+  ctx.noise.setVolume(static_cast<double>(vol) / 100.0);
   report_status(ctx);
   save_state(ctx);
 }
@@ -442,8 +391,22 @@ int main(int argc, char *argv[]) {
 
   app_context ctx = {};
 
-  ctx.player_a.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
-  ctx.player_b.setMedia(QUrl::fromLocalFile("/usr/lib/pink.wav"));
+  QAudioFormat fmt;
+
+  fmt.setSampleRate(44100);
+  fmt.setChannelCount(2);
+  fmt.setSampleSize(16);
+  fmt.setCodec("audio/pcm");
+  fmt.setByteOrder(QAudioFormat::LittleEndian);
+  fmt.setSampleType(QAudioFormat::UnSignedInt);
+  QAudioOutput player(fmt, &a);
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-stack-address"
+  ctx.player = &player;
+#pragma clang diagnostic pop
+
+  ctx.player->start(&ctx.noise);
 
   QObject::connect(&ctx.disco_agent,
                    &QBluetoothDeviceDiscoveryAgent::deviceDiscovered,
@@ -468,12 +431,6 @@ int main(int argc, char *argv[]) {
                    &QBluetoothLocalDevice::deviceDisconnected,
                    [&ctx](const QBluetoothAddress &address) {
                      bt_disconnected(ctx, address);
-                   });
-
-  QObject::connect(&ctx.player_timer,
-                   &QTimer::timeout,
-                   [&ctx]() {
-                     play_interval(ctx);
                    });
 
   QBluetoothServer rfcomm_server(QBluetoothServiceInfo::RfcommProtocol, &a);
