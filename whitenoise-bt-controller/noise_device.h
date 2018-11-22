@@ -3,27 +3,33 @@
 
 #include <QIODevice>
 #include <fstream>
+#include <cstring>
+#include <algorithm>
 
 class noise_device : public QIODevice {
  public:
 
   noise_device() {
-    open(QIODevice::ReadOnly);
+    noise_data_len = 0;
 
     // read noise data into buffer
-    std::ifstream noise_if("../brown.raw", std::ios::binary | std::ios::ate);
+    std::ifstream noise_if("../brown.raw", std::ios::binary);
 
     if (noise_if.bad()) {
       std::cerr <<  "could not open noise buffer" << std::endl;
     } else {
-      noise_data_len = std::static_cast<unsigned long>(noise_if.tellg());
+      noise_if.seekg (0, std::istream::end);
+      noise_data_len = static_cast<unsigned long>(noise_if.tellg());
+      noise_if.seekg (0, std::istream::beg);
+
       std::cerr << "opened noise buffer file of length: " << noise_data_len << std::endl;
 
-      noise_buffer.reserve(noise_data_len);
+      noise_buffer.resize(noise_data_len);
+      noise_if.read(noise_buffer.data(), noise_data_len);
 
-      if (noise_if.read(noise_buffer.data(), noise_data_len))
-      {
+      if (noise_if) {
         std::cerr << "read noise buffer" << std::endl;
+        open(QIODevice::ReadOnly);
       } else {
         std::cerr << "failed to read noise buffer" << std::endl;
       }
@@ -46,11 +52,14 @@ class noise_device : public QIODevice {
   }
 
  protected:
-  virtual qint64 readData(char *data, qint64 maxlen) override {
-    std::cerr << "readData: " << maxlen << std::endl;
-    return -1;
+  qint64 readData(char *data, qint64 maxlen) override {
+    auto len_to_read = std::min(static_cast<unsigned long>(maxlen), noise_data_len - pos);
+    std::memcpy(data, noise_buffer.data() + pos, len_to_read);
+    pos += len_to_read;
+    pos = pos % noise_data_len;
+    return static_cast<qint64>(len_to_read);
   }
-  virtual qint64 writeData(const char *data, qint64 len) override {
+  qint64 writeData(const char *data, qint64 len) override {
     return -1;
   }
 

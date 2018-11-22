@@ -23,7 +23,7 @@ int main(int argc, char *argv[]) {
   fmt.setSampleRate(44100);
   fmt.setChannelCount(2);
   fmt.setSampleSize(16);
-  fmt.setCodec("audio/wav");
+  fmt.setCodec("audio/pcm");
   fmt.setByteOrder(QAudioFormat::LittleEndian);
   fmt.setSampleType(QAudioFormat::UnSignedInt);
 
